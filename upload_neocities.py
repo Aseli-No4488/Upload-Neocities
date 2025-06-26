@@ -1,111 +1,137 @@
+from __future__ import annotations
+import configparser, hashlib, os, sys, time, typing as T
+from pathlib import Path
+
+import requests
 import neocities
-import configparser
-import os
 from alive_progress import alive_bar
 
-version = '1.0'
+VERSION = "2.1"          # ← bump whenever you ship a fix
 
 
-def create_default_config():
-    config = configparser.ConfigParser()
-    config['DEFAULT'] = {
-        'version': version,
-        'id': "your-neocities-id",
-        'password': "your-neocities-key",
-        'include_files': "html,css,js,png,jpg,jpeg,gif,webp",
+# ──── helpers ────────────────────────────────────────────────────────
+def sha1_file(p: Path, buf: int = 128 * 1024) -> str:
+    """
+    Hex SHA-1 of *p*.  Uses hashlib.file_digest on 3.11+, else manual loop.
+    """
+    if hasattr(hashlib, "file_digest"):               # Python 3.11+
+        with p.open("rb") as fh:
+            return hashlib.file_digest(fh, "sha1").hexdigest()
+
+    h = hashlib.sha1()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(buf), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def chunked(seq: list[T.Any], n: int) -> T.Iterator[list[T.Any]]:
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
+def create_default_config(path: Path) -> None:
+    cfg = configparser.ConfigParser()
+    cfg["DEFAULT"] = {
+        "version": VERSION,
+        "id": "your-neocities-id",
+        "password": "your-neocities-password-or-key",
+        "api_key": "",
+        "include_files": "html,css,js,png,jpg,jpeg,gif,webp",
+        "batch_size": "100",
     }
-    try:
-        with open('config.ini', 'w', encoding='utf8') as configfile:
-            config.write(configfile)
-        return True
-    except Exception as e:
-        print('Error creating configuration file:', e)
-        print('Try running the program as an administrator.')
-        return False
-    
-def get_files(path="./", include_files=["html", "css", "js", "png", "jpg", "jpeg", "gif", "webp"]):
-    result = []
-    for file in os.listdir(path):
-        file = path + file
-        
-        # Check if file is a directory
-        if os.path.isdir(file):
-            # Get files in directory
-            result += get_files(file + "/")
-        
-        else:
-            
-            # Check if file is in include_files
-            if not any(file_name in file for file_name in include_files): continue
-            
-            result.append(file.replace("./", ""))
-    
-    return result
-    
-if __name__ == '__main__':
-    # Load the configuration file
-    if not os.path.exists('config.ini'):
-        print('No configuration file found. Creating one...')
-        if not create_default_config(): exit(1)
-    
-    # Load the configuration
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='utf8')
-    
+    with path.open("w", encoding="utf8") as fh:
+        cfg.write(fh)
+    print("Created template config.ini – fill in your credentials and rerun.")
+
+
+def retry_on_rate_limit(fn, *a, **kw):
+    """
+    Call *fn* (no args expected) and back-off 60→120→240 s on HTTP 429/5xx.
+    """
+    delay = 60
     while True:
-        # Ask account
-        id = input(f"Enter your Neocities ID({config['DEFAULT']['id']}): ")
-        if id == '':
-            id = config['DEFAULT']['id']
-        else:
-            config['DEFAULT']['id'] = id
-            
-        password = input(f"Enter your Neocities password({config['DEFAULT']['password']}): ")
-        if password == '':
-            password = config['DEFAULT']['password']
-        else:
-            config['DEFAULT']['password'] = password
-    
-        # Login
         try:
-            nc = neocities.NeoCities(id, password)
-            break
-        except Exception as e:
-            print("Error:", e)
-            print('Login failed. Please retry \n\n', )
-    
-    # Save the configuration
-    with open('config.ini', 'w', encoding='utf8') as configfile:
-        config.write(configfile)
+            return fn(*a, **kw)
+        except requests.HTTPError as e:
+            if e.response.status_code in (429, 500, 502, 503, 504):
+                print(f"⚠  {e.response.status_code}; retrying in {delay}s…")
+                time.sleep(delay)
+                delay = min(delay * 2, 600)
+            else:
+                raise
 
-    # Get files in current directory
-    files = get_files("./", config['DEFAULT']['include_files'].split(","))
-    uploaded_files = nc.listitems()['files']
-    
-    
-    existing_files = {"path": [file['path'] for file in uploaded_files if not file['is_directory']],
-                  "size": [file['size'] for file in uploaded_files if not file['is_directory']],}
-    
-    total_file_len = len(files)
 
-    # Filter out files that are already uploaded and are the same size
-    files = [file for file in files if (not (file in existing_files["path"])) or (os.path.getsize(file) != existing_files["size"][existing_files["path"].index(file)])]
+# ──── main routine ──────────────────────────────────────────────────
+def main() -> None:
+    cfg_path = Path("config.ini")
+    if not cfg_path.exists():
+        create_default_config(cfg_path)
+        sys.exit()
 
-    should_updated = [file for file in files if (file in existing_files["path"]) and (os.path.getsize(file) != existing_files["size"][existing_files["path"].index(file)])]
-    files.extend(should_updated)
+    cfg = configparser.ConfigParser()
+    cfg.read(cfg_path, encoding="utf8")
+    c = cfg["DEFAULT"]
 
-    print(f"Files to upload: {len(files)}/{total_file_len} ({total_file_len - len(existing_files['path'])} new, {len(should_updated)} need update)")
-    if(input("Do you want to continue? (y/n): ") != 'y'):
-        input('Press enter to exit...')
-        exit(0)
-    
-    with alive_bar(len(files), title='Uploading...', bar='classic') as bar:
-        for file in files:
-            nc.upload((file, file))
-            
-            # Update progress bar
-            bar()
+    # interactive credential prompt – ENTER keeps stored value
+    site_id  = input(f"Neocities ID [{c['id']}]: ") or c["id"]
+    secret   = input(f"Password / API key [{c['password']}]: ") or c["password"]
+    batch_sz = int(c.get("batch_size", "100"))
+    exts     = [e.strip().lower().lstrip(".") for e in c["include_files"].split(",")]
 
-    # Print success message
-    print("Upload complete!")
-    input('Press enter to exit...')
+    # save back what user typed
+    c.update({"id": site_id, "password": secret})
+    with cfg_path.open("w", encoding="utf8") as fh:
+        cfg.write(fh)
+
+    # connect
+    try:
+        if c.get("api_key"):
+            nc = neocities.NeoCities(api_key=c["api_key"])
+        else:
+            nc = neocities.NeoCities(site_id, secret)
+    except Exception as e:
+        sys.exit(f"✖  Could not create API client – {e}")
+
+    # pull remote file list
+    raw = retry_on_rate_limit(nc.listitems)              # GET /api/list
+    if raw.get("result") != "success" or "files" not in raw:
+        sys.exit(f"✖  API error: {raw.get('message', raw)}")
+
+    remote_index = {f["path"]: (f["size"], f["sha1_hash"])
+                    for f in raw["files"] if not f["is_directory"]}
+
+    # scan local tree
+    root = Path(".").resolve()
+    local = [p for p in root.rglob("*")
+             if p.is_file() and p.suffix.lstrip(".").lower() in exts]
+
+    to_send: list[tuple[str, str]] = []
+    for p in local:
+        rel = p.relative_to(root).as_posix()
+        size = p.stat().st_size
+        r_size, r_sha = remote_index.get(rel, (None, None))
+        if size != r_size or sha1_file(p) != r_sha:
+            to_send.append((rel, rel))
+
+    total = len(to_send)
+    print(f"→  {total} / {len(local)} files need upload/update.")
+    if not total or input("Continue? [y/N] ").lower() != "y":
+        input("✖  Press ENTER to exit.")
+        return
+
+    # batch upload
+    sent = 0
+    with alive_bar(total, title="Uploading", bar="classic") as bar:
+        for chunk in chunked(to_send, batch_sz):
+            retry_on_rate_limit(lambda: nc.upload(*chunk))
+            bar(len(chunk))
+            sent += len(chunk)
+
+    print(f"✓  Finished – {sent} file(s) uploaded in "
+          f"{(total - 1)//batch_sz + 1} request(s).")
+
+    input("Press ENTER to exit.")
+
+if __name__ == "__main__":
+    main()
