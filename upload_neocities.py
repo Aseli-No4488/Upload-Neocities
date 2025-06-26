@@ -6,7 +6,7 @@ import requests
 import neocities
 from alive_progress import alive_bar
 
-VERSION = "2.1"          # ← bump whenever you ship a fix
+VERSION = "2.1"
 
 
 # ──── helpers ────────────────────────────────────────────────────────
