@@ -37,7 +37,7 @@ def create_default_config(path: Path) -> None:
         "id": "your-neocities-id",
         "password": "your-neocities-password-or-key",
         "api_key": "",
-        "include_files": "html,css,js,png,jpg,jpeg,gif,webp",
+        "include_files": "html,css,js,png,jpg,jpeg,gif,webp,json",
         "batch_size": "100",
     }
     with path.open("w", encoding="utf8") as fh:
