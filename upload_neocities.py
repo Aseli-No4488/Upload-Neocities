@@ -6,7 +6,7 @@ import requests
 import neocities
 from alive_progress import alive_bar
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 # ──── helpers ────────────────────────────────────────────────────────
@@ -63,7 +63,12 @@ def retry_on_rate_limit(fn, *a, **kw):
 
 
 # ──── main routine ──────────────────────────────────────────────────
-def main() -> None:
+def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], None] = print) -> None:
+    if skip_input:
+        _input = lambda _: None  # type: ignore[assignment]
+    else:
+        _input = input
+    
     cfg_path = Path("config.ini")
     if not cfg_path.exists():
         create_default_config(cfg_path)
@@ -74,8 +79,8 @@ def main() -> None:
     c = cfg["DEFAULT"]
 
     # interactive credential prompt – ENTER keeps stored value
-    site_id  = input(f"Neocities ID [{c['id']}]: ") or c["id"]
-    secret   = input(f"Password / API key [{c['password']}]: ") or c["password"]
+    site_id  = _input(f"Neocities ID [{c['id']}]: ") or c["id"]
+    secret   = _input(f"Password / API key [{c['password']}]: ") or c["password"]
     batch_sz = int(c.get("batch_size", "100"))
     exts     = [e.strip().lower().lstrip(".") for e in c["include_files"].split(",")]
 
@@ -102,22 +107,23 @@ def main() -> None:
                     for f in raw["files"] if not f["is_directory"]}
 
     # scan local tree
-    root = Path(".").resolve()
+    root = Path(root_path).resolve()
     local = [p for p in root.rglob("*")
              if p.is_file() and p.suffix.lstrip(".").lower() in exts]
 
     to_send: list[tuple[str, str]] = []
     for p in local:
         rel = p.relative_to(root).as_posix()
+        abs = p.as_posix()
         size = p.stat().st_size
         r_size, r_sha = remote_index.get(rel, (None, None))
         if size != r_size or sha1_file(p) != r_sha:
-            to_send.append((rel, rel))
+            to_send.append((abs, rel))
 
     total = len(to_send)
-    print(f"→  {total} / {len(local)} files need upload/update.")
-    if not total or input("Continue? [y/N] ").lower() != "y":
-        input("✖  Press ENTER to exit.")
+    _print(f"→  {total} / {len(local)} files need upload/update.")
+    if not skip_input and (not total or _input("Continue? [y/N] ").lower() != "y"):
+        _input("✖  Press ENTER to exit.")
         return
 
     # batch upload
@@ -127,11 +133,13 @@ def main() -> None:
             retry_on_rate_limit(lambda: nc.upload(*chunk))
             bar(len(chunk))
             sent += len(chunk)
+            if not skip_input:
+                _print(f"  {sent} file(s) uploaded so far…")
 
-    print(f"✓  Finished – {sent} file(s) uploaded in "
+    _print(f"✓  Finished – {sent} file(s) uploaded in "
           f"{(total - 1)//batch_sz + 1} request(s).")
 
-    input("Press ENTER to exit.")
+    _input("Press ENTER to exit.")
 
 if __name__ == "__main__":
     main()
