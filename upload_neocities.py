@@ -5,8 +5,10 @@ from pathlib import Path
 import requests
 import neocities
 from alive_progress import alive_bar
+from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.1"
+
+VERSION = "2.2"
 
 
 # ──── helpers ────────────────────────────────────────────────────────
@@ -84,6 +86,8 @@ def main() -> None:
     with cfg_path.open("w", encoding="utf8") as fh:
         cfg.write(fh)
 
+    print(f"Using Neocities ID: {site_id} (API key: {bool(c.get('api_key'))})")
+    print("Trying to connect to Neocities…")
     # connect
     try:
         if c.get("api_key"):
@@ -101,21 +105,33 @@ def main() -> None:
     remote_index = {f["path"]: (f["size"], f["sha1_hash"])
                     for f in raw["files"] if not f["is_directory"]}
 
+    print(f"→  Found {len(remote_index)} files on Neocities.")
+
     # scan local tree
     root = Path(".").resolve()
     local = [p for p in root.rglob("*")
              if p.is_file() and p.suffix.lstrip(".").lower() in exts]
 
     to_send: list[tuple[str, str]] = []
-    for p in local:
-        rel = p.relative_to(root).as_posix()
-        size = p.stat().st_size
-        r_size, r_sha = remote_index.get(rel, (None, None))
-        if size != r_size or sha1_file(p) != r_sha:
-            to_send.append((rel, rel))
+    with alive_bar(len(local), title="Scanning local files", bar="classic") as bar:
+
+        # The bottleneck is the file I/O, so we can use multi-threading
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(sha1_file, p): p for p in local}
+            for future in futures:
+                try:
+                    sha = future.result()
+                    rel = futures[future].relative_to(root).as_posix()
+                    size = futures[future].stat().st_size
+                    r_size, r_sha = remote_index.get(rel, (None, None))
+                    if size != r_size or sha != r_sha:
+                        to_send.append((rel, rel))
+                except Exception as e:
+                    print(f"✖  Error processing {futures[future]}: {e}")
+                bar()
 
     total = len(to_send)
-    print(f"→  {total} / {len(local)} files need upload/update.")
+    print(f"→  {total} / {len(local)} files need to be uploaded/updated. ({to_send[0][0][:10]}...)")
     if not total or input("Continue? [y/N] ").lower() != "y":
         input("✖  Press ENTER to exit.")
         return
