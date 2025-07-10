@@ -5,6 +5,8 @@ from pathlib import Path
 import requests
 import neocities
 from alive_progress import alive_bar
+from concurrent.futures import ThreadPoolExecutor
+
 
 VERSION = "2.2"
 
@@ -63,12 +65,7 @@ def retry_on_rate_limit(fn, *a, **kw):
 
 
 # ──── main routine ──────────────────────────────────────────────────
-def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], None] = print) -> None:
-    if skip_input:
-        _input = lambda _: None  # type: ignore[assignment]
-    else:
-        _input = input
-    
+def main() -> None:
     cfg_path = Path("config.ini")
     if not cfg_path.exists():
         create_default_config(cfg_path)
@@ -79,8 +76,8 @@ def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], Non
     c = cfg["DEFAULT"]
 
     # interactive credential prompt – ENTER keeps stored value
-    site_id  = _input(f"Neocities ID [{c['id']}]: ") or c["id"]
-    secret   = _input(f"Password / API key [{c['password']}]: ") or c["password"]
+    site_id  = input(f"Neocities ID [{c['id']}]: ") or c["id"]
+    secret   = input(f"Password / API key [{c['password']}]: ") or c["password"]
     batch_sz = int(c.get("batch_size", "100"))
     exts     = [e.strip().lower().lstrip(".") for e in c["include_files"].split(",")]
 
@@ -89,6 +86,8 @@ def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], Non
     with cfg_path.open("w", encoding="utf8") as fh:
         cfg.write(fh)
 
+    print(f"Using Neocities ID: {site_id} (API key: {bool(c.get('api_key'))})")
+    print("Trying to connect to Neocities…")
     # connect
     try:
         if c.get("api_key"):
@@ -106,24 +105,35 @@ def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], Non
     remote_index = {f["path"]: (f["size"], f["sha1_hash"])
                     for f in raw["files"] if not f["is_directory"]}
 
+    print(f"→  Found {len(remote_index)} files on Neocities.")
+
     # scan local tree
-    root = Path(root_path).resolve()
+    root = Path(".").resolve()
     local = [p for p in root.rglob("*")
              if p.is_file() and p.suffix.lstrip(".").lower() in exts]
 
     to_send: list[tuple[str, str]] = []
-    for p in local:
-        rel = p.relative_to(root).as_posix()
-        abs = p.as_posix()
-        size = p.stat().st_size
-        r_size, r_sha = remote_index.get(rel, (None, None))
-        if size != r_size or sha1_file(p) != r_sha:
-            to_send.append((abs, rel))
+    with alive_bar(len(local), title="Scanning local files", bar="classic") as bar:
+
+        # The bottleneck is the file I/O, so we can use multi-threading
+        with ThreadPoolExecutor() as executor:
+            futures = {executor.submit(sha1_file, p): p for p in local}
+            for future in futures:
+                try:
+                    sha = future.result()
+                    rel = futures[future].relative_to(root).as_posix()
+                    size = futures[future].stat().st_size
+                    r_size, r_sha = remote_index.get(rel, (None, None))
+                    if size != r_size or sha != r_sha:
+                        to_send.append((rel, rel))
+                except Exception as e:
+                    print(f"✖  Error processing {futures[future]}: {e}")
+                bar()
 
     total = len(to_send)
-    _print(f"→  {total} / {len(local)} files need upload/update.")
-    if not skip_input and (not total or _input("Continue? [y/N] ").lower() != "y"):
-        _input("✖  Press ENTER to exit.")
+    print(f"→  {total} / {len(local)} files need to be uploaded/updated. ({to_send[0][0][:10]}...)")
+    if not total or input("Continue? [y/N] ").lower() != "y":
+        input("✖  Press ENTER to exit.")
         return
 
     # batch upload
@@ -133,13 +143,11 @@ def main(root_path = '.', skip_input:bool = False, _print: T.Callable[[str], Non
             retry_on_rate_limit(lambda: nc.upload(*chunk))
             bar(len(chunk))
             sent += len(chunk)
-            if not skip_input:
-                _print(f"  {sent} file(s) uploaded so far…")
 
-    _print(f"✓  Finished – {sent} file(s) uploaded in "
+    print(f"✓  Finished – {sent} file(s) uploaded in "
           f"{(total - 1)//batch_sz + 1} request(s).")
 
-    _input("Press ENTER to exit.")
+    input("Press ENTER to exit.")
 
 if __name__ == "__main__":
     main()
